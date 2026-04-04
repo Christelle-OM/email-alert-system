@@ -1,12 +1,7 @@
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from typing import Optional, List
-from enum import Enum
-
-class AlertStatus(str, Enum):
-    PENDING = "pending"
-    SENT = "sent"
-    FAILED = "failed"
+from .models import AlertStatus
 
 class AlertCreate(BaseModel):
     """Schema for creating an alert"""

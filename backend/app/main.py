@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
+import os
 
 from .config import settings
 from .database import get_db, init_db
@@ -24,6 +25,60 @@ app = FastAPI(
     debug=settings.DEBUG
 )
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+scheduler = AsyncIOScheduler()
+
+async def send_scheduled_alerts_job():
+    from .database import SessionLocal
+    db = SessionLocal()
+    now = datetime.now(timezone.utc)
+    pending_alerts = db.query(Alert).filter(
+        Alert.status == AlertStatusEnum.PENDING,
+        Alert.scheduled_for <= now
+    ).all()
+    
+    for alert in pending_alerts:
+        success, error_msg = await EmailService.send_email(
+            alert.recipient_email, alert.subject, alert.message
+        )
+        if success:
+            alert.status = AlertStatusEnum.SENT
+            alert.sent_at = datetime.now(timezone.utc)
+        else:
+            alert.status = AlertStatusEnum.FAILED
+            alert.error_message = error_msg
+        db.commit()
+    db.close()
+
+@app.on_event("startup")
+async def startup_event():
+    scheduler.add_job(send_scheduled_alerts_job, 'interval', minutes=1)
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+
+async def process_alert(alert_id: int, email: str, subject: str, message: str):
+    from .database import SessionLocal
+    db = SessionLocal()
+    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+    if alert:
+        try:
+            success, error_msg = await EmailService.send_email(email, subject, message)
+            if success:
+                alert.status = AlertStatusEnum.SENT
+                alert.sent_at = datetime.now(timezone.utc)
+            else:
+                alert.status = AlertStatusEnum.FAILED
+                alert.error_message = error_msg
+            db.commit()
+        except Exception as e:
+            alert.status = AlertStatusEnum.FAILED
+            alert.error_message = str(e)
+            db.commit()
+    db.close()
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +99,7 @@ async def health_check():
 @app.post("/api/alerts/send", response_model=AlertResponse)
 async def send_alert(
     alert: AlertCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """Send a single email alert"""
@@ -59,36 +115,29 @@ async def send_alert(
     db.commit()
     db.refresh(db_alert)
     
-    # Send email if not scheduled
-    if not alert.scheduled_for or alert.scheduled_for <= datetime.utcnow():
-        success, error_msg = await EmailService.send_email(
+    # Send email in background if not scheduled
+    if not alert.scheduled_for or alert.scheduled_for <= datetime.now(timezone.utc):
+        background_tasks.add_task(
+            process_alert,
+            db_alert.id,
             alert.recipient_email,
             alert.subject,
             alert.message
         )
-        
-        if success:
-            db_alert.status = AlertStatusEnum.SENT
-            db_alert.sent_at = datetime.utcnow()
-        else:
-            db_alert.status = AlertStatusEnum.FAILED
-            db_alert.error_message = error_msg
-        
-        db.commit()
-        db.refresh(db_alert)
     
     return db_alert
 
 @app.post("/api/alerts/send-bulk", response_model=dict)
 async def send_bulk_alerts(
     bulk_alert: BulkAlertCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """Send alerts to multiple recipients"""
     
     results = {
         "total": len(bulk_alert.recipient_emails),
-        "sent": 0,
+        "sent": 0, # Queued
         "failed": 0,
         "scheduled": 0
     }
@@ -105,23 +154,15 @@ async def send_bulk_alerts(
         db.refresh(db_alert)
         
         # Send if not scheduled
-        if not bulk_alert.scheduled_for or bulk_alert.scheduled_for <= datetime.utcnow():
-            success, error_msg = await EmailService.send_email(
+        if not bulk_alert.scheduled_for or bulk_alert.scheduled_for <= datetime.now(timezone.utc):
+            background_tasks.add_task(
+                process_alert,
+                db_alert.id,
                 email,
                 bulk_alert.subject,
                 bulk_alert.message
             )
-            
-            if success:
-                db_alert.status = AlertStatusEnum.SENT
-                db_alert.sent_at = datetime.utcnow()
-                results["sent"] += 1
-            else:
-                db_alert.status = AlertStatusEnum.FAILED
-                db_alert.error_message = error_msg
-                results["failed"] += 1
-            
-            db.commit()
+            results["sent"] += 1
         else:
             results["scheduled"] += 1
     
@@ -290,6 +331,17 @@ async def get_stats(db: Session = Depends(get_db)):
         }
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Récupère le chemin absolu du dossier parent du fichier actuel
+base_path = os.path.dirname(os.path.abspath(__file__))
+frontend_path = os.path.join(base_path, "../../frontend")
+
+# Monter le dossier frontend (ce dossier devra être copié à côté de l'app ou lié proprement)
+app.mount("/static", StaticFiles(directory=frontend_path), name="static")
+
+@app.get("/")
+async def serve_frontend():
+    index_path = os.path.join(frontend_path, "index.html")
+    return FileResponse(index_path)

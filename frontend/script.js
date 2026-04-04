@@ -1,5 +1,5 @@
 // API Configuration
-const API_BASE_URL = 'http://localhost:8000/api';
+const API_BASE_URL = '/api';
 
 // Utility Functions
 function showAlert(elementId, message, type = 'success') {
@@ -15,7 +15,7 @@ function clearAlert(elementId) {
 
 async function checkApiHealth() {
     try {
-        const response = await fetch('http://localhost:8000/health');
+        const response = await fetch('/health');
         const data = await response.json();
         document.getElementById('api-status').textContent = 'Online ✓';
         document.getElementById('api-status').style.color = '#28a745';
@@ -75,7 +75,7 @@ document.getElementById('send-alert-form').addEventListener('submit', async (e) 
             payload.scheduled_for = new Date(scheduledTime).toISOString();
         }
         
-        const response = await fetch(`${API_BASE_URL}/alerts/send`, {
+        const response = await fetch(`/api/alerts/send`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
